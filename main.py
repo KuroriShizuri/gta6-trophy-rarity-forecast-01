@@ -17,17 +17,25 @@ Pipeline (per case, per trophy):
      (MODEL below), then q_tau = sigmoid(median_logit + z_tau * sigma),
      rounded to 4 decimals (half up, as the kit starter does).
 
-MODEL SELECTION -- PROVISIONAL, NOT FINAL (see docs/MODEL-DECISION.md).
-The user decides the final model family; this file implements all three
-candidate families behind one switch so the choice is a one-line change:
+MODEL SELECTION -- FINAL (see docs/MODEL-DECISION.md).
+The user decided (2026-11-19) that all five model questions are answered
+from GTA V data, the only prior available. The shipped family is a
+combination: poisson-hazard median, regularized by a GTA V per-type prior
+(saturation levels from Exophase PS3 cumulative rarity), with the shared
+spread. All three families stay implemented behind one switch for
+experiments; the grader runs with no environment, so the in-file MODEL is
+what ships:
 
-  MODEL = "logit-linear"      # PROVISIONAL default: shrunk OLS of logit(rate)
-                              # on hours, fitted on the last 24 h of reads.
-  MODEL = "poisson-hazard"    # per-trophy decaying-hazard fit on earner
-                              # counts + log-linear players-tracked forecast.
+  MODEL = "poisson-hazard"    # FINAL: decaying-hazard fit on earner counts
+                              # + log-linear players-tracked forecast, with
+                              # GTA V per-type E_inf cap + weak log-lambda
+                              # prior (see LAMBDA_PRIOR / PRIOR_SATURATION).
+  MODEL = "logit-linear"      # shrunk OLS of logit(rate) on hours, fitted
+                              # on the last 24 h of reads (not shipped).
   MODEL = "prior-shape"       # last rate x a baked per-tier shape factor
-                              # (all factors are 1.0 until a credible
-                              # week-one prior is supplied: carry-forward).
+                              # (all factors 1.0 = carry-forward; not
+                              # shipped -- cumulative GTA V rarity is the
+                              # wrong object for a level prior).
 
 Override for local experiments only: MAKEFUN_MODEL=<name>. The grader runs
 with no environment, so the in-file MODEL is what ships.
@@ -73,12 +81,12 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 # ---------------------------------------------------------------------------
-# Model selection (PROVISIONAL -- see docs/MODEL-DECISION.md).
+# Model selection (FINAL -- see docs/MODEL-DECISION.md).
 # ---------------------------------------------------------------------------
-MODEL = os.environ.get("MAKEFUN_MODEL", "logit-linear")
+MODEL = os.environ.get("MAKEFUN_MODEL", "poisson-hazard")
 MODELS = ("logit-linear", "poisson-hazard", "prior-shape")
 
-# --- shared spread parameters (PROVISIONAL placeholders) ------------------
+# --- shared spread parameters (FINAL: kept from provisional) ---------------
 SIGMA_RW = 0.5          # logit units per sqrt(day), house baseline's value.
 STALE_SIGMA = 1.5       # logit spread added when the page has not changed
                         # at all (a refresh is overdue); decays as fresh
@@ -87,13 +95,13 @@ STALE_TAU_HOURS = 8.0   # staleness decay time.
 SIGMA_CAP = 2.5         # hard cap on total logit spread.
 SIGMA_FLOOR = 0.05      # never report a (near-)degenerate band.
 
-# --- logit-linear parameters (PROVISIONAL) ---------------------------------
+# --- logit-linear parameters (not shipped; kept for experiments) -----------
 FIT_WINDOW_HOURS = 24.0  # fit on the last 24 h of reads (house curve baseline).
 SHRINK_K = 4.0           # slope *= n / (n + SHRINK_K); n = fitted points.
 MAX_SLOPE = 0.10         # |logit/hour| cap on the fitted slope.
 MAX_SHIFT = 3.0          # |median logit - last logit| cap on extrapolation.
 
-# --- poisson-hazard parameters (PROVISIONAL) -------------------------------
+# --- poisson-hazard parameters (FINAL: GTA V prior, docs/MODEL-DECISION.md)
 HAZARD_TAU_HOURS = 72.0  # hazard decay time h(t) = h0 * exp(-t / TAU).
 # Grid of decay rates lam = 1/TAU_eff searched per trophy (per hour).
 # The grid MUST reach the saturated regime (lam >> 1 / observed span):
@@ -103,11 +111,72 @@ HAZARD_TAU_HOURS = 72.0  # hazard decay time h(t) = h0 * exp(-t / TAU).
 # timescales from ~1 minute (lam=100) to ~1 year (lam=1e-4).
 HAZARD_LAM_GRID = tuple(10.0 ** (-4.0 + 0.25 * i) for i in range(25))
 
-# --- prior-shape parameters (PROVISIONAL: all 1.0 = carry-forward) ---------
+# --- GTA V prior (FINAL, 2026-11-19; source: Exophase PS3 cumulative rarity,
+# fetched 2026-11-19 -- see docs/MODEL-DECISION.md for the table + mapping).
+# GTA V is the only prior data: its trackers hold TODAY's cumulative rarity
+# (13-year equilibrium), not a launch-week curve, so it is used as a SHAPE
+# prior (relative saturation per trophy TYPE) with the LEVEL taken from GTA
+# VI's own current rates -- never as a level. The 55 GTA VI trophies are
+# grouped by kind (guide data) into six prior groups; each group's saturation
+# S is the MEDIAN Exophase PS3 cumulative rarity of its GTA V analogs:
+#   story: 11 GTA V story missions, median 56.00%.
+#   robbery: 5 GTA V heist story missions, median 57.86%.
+#   side: 15 GTA V side activities / economy / exploration / stranger
+#     trophies pooled, median 20.38% (activity, stranger, misc, exploration,
+#     economy, combat kinds -- no single clean analog each, so pooled).
+#   collectible: 3 GTA V collectible sets, median 10.72% (tight: 9.96-10.91).
+#   grind: 70 gold medals 5.70%, 100% completion 7.03%, Close Shave 6.64%,
+#     median 6.64% (gold-medal activities + 100% completion).
+#   platinum: 3.90% (n=1).
+# LAMBDA_PRIOR is the weak centre of a log-lambda penalty (see
+# model_poisson_hazard): tau = time to 63% of saturation, set by the content's
+# nature -- story chapters finish in ~1 day, heists ~2 days, side content
+# ~3 days, collectibles ~1 week, grind ~2 weeks, platinum ~30 days. These
+# taus are a STATED ASSUMPTION (no launch-week curve exists to estimate them
+# from; the Wayback snapshot of the Exophase page at 2013-10-29 exists but
+# could not be fetched). The penalty weight is deliberately weak: it only
+# breaks ties on flat history and is overruled by real movement.
+TROPHY_PRIOR = {
+    1: "platinum",
+    2: "story", 3: "story", 4: "story", 5: "story", 6: "story", 7: "story",
+    8: "story", 9: "story", 10: "story", 11: "story", 12: "story", 13: "story",
+    14: "grind", 15: "grind", 17: "grind",
+    16: "side", 18: "side", 19: "side", 20: "side", 21: "side", 22: "side",
+    23: "side", 24: "side", 25: "side", 26: "side", 27: "side", 28: "side",
+    29: "side", 32: "side", 33: "side", 35: "side", 36: "side", 37: "side",
+    38: "side", 42: "side", 44: "side", 45: "side", 46: "side", 47: "side",
+    48: "side", 49: "side", 50: "side", 51: "side", 52: "side", 53: "side",
+    54: "side", 55: "side",
+    30: "collectible", 31: "collectible",
+    34: "robbery", 39: "robbery", 40: "robbery", 41: "robbery", 43: "robbery",
+}
+PRIOR_SATURATION = {"story": 0.5600, "robbery": 0.5786, "side": 0.2038,
+                    "collectible": 0.1072, "grind": 0.0664, "platinum": 0.0390}
+LAMBDA_PRIOR = {"story": 0.0417, "robbery": 0.0208, "side": 0.0139,
+                "collectible": 0.0060, "grind": 0.0030, "platinum": 0.0014}
+E_INF_CAP_MULT = 1.5   # fitted E_inf may not exceed 1.5x the group's GTA V
+                       # saturation (as a rate at target), nor the observed
+                       # earner count -- whichever is larger.
+LAMBDA_PENALTY_W = 0.001  # weight of the weak log-lambda prior, in relative
+                          # SSE units (see model_poisson_hazard).
+P_SLOPE_CAP = 0.01        # |log players-tracked/hour| cap on the P(t) fit.
+                          # The provisional 0.05/h lets P(t) explode: a
+                          # single early refresh jump (638 -> 3,868 in ~5 h)
+                          # gives a 48 h OLS slope near 0.04/h, which
+                          # extrapolates to ~100x players by day 7 and
+                          # collapses every median toward zero. 0.01/h still
+                          # allows 3.3x denominator growth over the 5-day
+                          # horizon (plausible launch-week surge) while
+                          # bounding the dilution. JUDGMENT CALL (no GTA V
+                          # P(t) curve exists to calibrate it) -- flagged in
+                          # docs/MODEL-DECISION.md.
+
+# --- prior-shape parameters (not shipped: all 1.0 = carry-forward) ---------
 # No credible week-one launch curve is baked in (see docs/MODEL-DECISION.md):
 # cumulative GTA IV/V rarities are the wrong object (long-run equilibrium,
-# not a week-one curve). Until the user supplies/decides a prior, every
-# factor is 1.0 and this model is carry-forward with the shared spread.
+# not a week-one curve). Until a launch-week curve exists, every factor is
+# 1.0 and this model is carry-forward with the shared spread. The GTA V prior
+# is used inside the poisson-hazard model instead (PRIOR_SATURATION above).
 SHAPE_FACTOR = {"platinum": 1.0, "gold": 1.0, "silver": 1.0, "bronze": 1.0}
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
@@ -244,7 +313,7 @@ def spread_sigma(case, series, horizon_h, se_slope=0.0):
 # The three candidate model families. Each returns (median_logit, sigma).
 # ---------------------------------------------------------------------------
 def model_logit_linear(case, series, horizon_h, t0):
-    """PROVISIONAL: shrunk OLS of logit(rate) on hours over the last
+    """Not shipped (see MODEL): shrunk OLS of logit(rate) on hours over the last
     FIT_WINDOW_HOURS of reads, extrapolated to the target. Flat history ->
     slope 0 -> carry-forward median."""
     t_end = (parse_time(case["at"]) - t0).total_seconds() / 3600.0
@@ -266,19 +335,29 @@ def model_logit_linear(case, series, horizon_h, t0):
 
 
 def model_poisson_hazard(case, series, horizon_h, t0):
-    """Decaying-hazard fit on earner COUNTS, not rates: E(t) is the number of
-    tracked players holding the trophy, players P(t) the denominator.
-    E(t) = E_inf * (1 - exp(-lam * t)), t hours since release; lam picked by
-    least squares over a grid, E_inf by linear scale at that lam. P(t) is
-    forecast by log-linear fit on players_tracked. Rate = 100 * E / P.
-    Flat history -> lam -> 0 boundary -> E ~ E_last, P ~ P_last: carry-forward.
-    NOTE: on launch-night data the earners series is exactly constant, so
-    lam is unidentified here; the fit returns the boundary (flat) forecast
-    and the spread carries the uncertainty. See docs/MODEL-DECISION.md."""
+    """Decaying-hazard fit on earner COUNTS, regularized by a GTA V prior
+    (FINAL -- see docs/MODEL-DECISION.md). E(t) = E_inf * (1 - exp(-lam*t)),
+    t hours since release; lam picked by penalized least squares over a grid,
+    E_inf by linear scale at that lam. P(t) is forecast by log-linear fit on
+    players_tracked. Rate = 100 * E / P -- so the median shifts DOWN when the
+    tracked-player denominator grows (the refresh mechanism, modelled
+    explicitly, not an ad-hoc offset). The GTA V prior enters twice:
+    (1) a hard cap E_inf <= max(E_last, E_INF_CAP_MULT * S_group * P_target),
+    where S_group is the GTA V median long-run saturation of the trophy's
+    type (Exophase PS3) -- the cap bounds extrapolated growth, never the
+    observed level; (2) a weak log-lambda penalty pulling lam toward the
+    group's prior centre, which only breaks ties on flat history and is
+    overruled by real movement. Flat history -> saturated fit, E_inf ~ E_last,
+    P ~ P_last: carry-forward."""
     release = parse_time(case.get("game", {}).get("release_date", case["history"][0]["at"]))
     hist = case["history"]
     if series.last_rate is None or not hist:
         return logit(1.0), SIGMA_CAP
+    # GTA V prior group for this trophy (by id; default "side").
+    tid = case["trophies"][series.idx].get("id", 0)
+    group = TROPHY_PRIOR.get(tid, "side")
+    sat = PRIOR_SATURATION[group]
+    lam0 = LAMBDA_PRIOR[group]
     # Earner counts per read.
     obs = []
     for h in hist:
@@ -294,6 +373,21 @@ def model_poisson_hazard(case, series, horizon_h, t0):
         obs.append((t, float(rates[series.idx]) / 100.0 * float(players)))
     if len(obs) < 2:
         return logit(series.last_rate), spread_sigma(case, series, horizon_h)
+    # Players-tracked forecast first: the E_inf cap is a rate cap at target.
+    t_target = (parse_time(case["target"]) - release).total_seconds() / 3600.0
+    p_pts = [((parse_time(h["at"]) - release).total_seconds() / 3600.0,
+              math.log(float(h["players_tracked"])))
+             for h in hist if h.get("players_tracked")]
+    p_target = float(hist[-1]["players_tracked"])
+    if len(p_pts) >= 2:
+        _, b, _, _ = ols([t for (t, _) in p_pts], [y for (_, y) in p_pts])
+        b = max(-P_SLOPE_CAP, min(P_SLOPE_CAP, b))
+        t_last = p_pts[-1][0]
+        p_target = math.exp(math.log(p_target) + b * max(0.0, t_target - t_last))
+        p_target = max(p_target, 1.0)
+    e_inf_cap = max(obs[-1][1], E_INF_CAP_MULT * sat * p_target)
+    mean_e = sum(e for (_, e) in obs) / len(obs)
+    scale = len(obs) * mean_e * mean_e if mean_e > 0 else 0.0
     best = None
     for lam in HAZARD_LAM_GRID:
         f = [1.0 - math.exp(-lam * t) for (t, _) in obs]
@@ -301,25 +395,25 @@ def model_poisson_hazard(case, series, horizon_h, t0):
         if denom <= 0:
             continue
         e_inf = sum(e * v for (_, e), v in zip(obs, f)) / denom
-        if e_inf < 0:
+        if e_inf < 0 or e_inf > e_inf_cap:
             continue
         sse = sum((e - e_inf * v) ** 2 for (_, e), v in zip(obs, f))
-        if best is None or sse < best[0]:
-            best = (sse, lam, e_inf)
+        # Penalized relative score: plain least squares, plus a weak prior
+        # pulling log10(lam) toward the group's centre. The penalty is
+        # dimensionless (SSE scaled by n * mean_e^2); it breaks ties on flat
+        # history and is overruled whenever the data prefers another lam by
+        # more than the penalty weight.
+        if scale > 0:
+            rel = sse / scale + LAMBDA_PENALTY_W * (math.log10(lam) - math.log10(lam0)) ** 2
+        else:
+            rel = sse
+        if best is None or rel < best[0]:
+            best = (rel, lam, e_inf)
+    if best is None:
+        # Every grid point violated the cap: fall back to carry-forward.
+        return logit(series.last_rate), spread_sigma(case, series, horizon_h)
     _, lam, e_inf = best
-    t_target = (parse_time(case["target"]) - release).total_seconds() / 3600.0
     e_target = e_inf * (1.0 - math.exp(-lam * max(t_target, 0.0)))
-    # Players-tracked forecast: log-linear in t (flat if no growth seen).
-    p_pts = [((parse_time(h["at"]) - release).total_seconds() / 3600.0,
-              math.log(float(h["players_tracked"])))
-             for h in hist if h.get("players_tracked")]
-    p_target = float(hist[-1]["players_tracked"])
-    if len(p_pts) >= 2:
-        _, b, _, _ = ols([t for (t, _) in p_pts], [y for (_, y) in p_pts])
-        b = max(-0.05, min(0.05, b))
-        t_last = p_pts[-1][0]
-        p_target = math.exp(math.log(p_target) + b * max(0.0, t_target - t_last))
-        p_target = max(p_target, 1.0)
     rate = clamp(100.0 * max(e_target, 0.0) / p_target)
     return logit(rate), spread_sigma(case, series, horizon_h)
 
