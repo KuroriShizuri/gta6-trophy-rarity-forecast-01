@@ -26,10 +26,13 @@ spread. All three families stay implemented behind one switch for
 experiments; the grader runs with no environment, so the in-file MODEL is
 what ships:
 
-  MODEL = "poisson-hazard"    # FINAL: decaying-hazard fit on earner counts
-                              # + log-linear players-tracked forecast, with
-                              # GTA V per-type E_inf cap + weak log-lambda
-                              # prior (see LAMBDA_PRIOR / PRIOR_SATURATION).
+  MODEL = "poisson-hazard"    # FINAL v2: decaying-hazard fit on earner
+                              # counts + denominator as a SCENARIO MIXTURE
+                              # (refresh probability + size), with GTA V
+                              # per-type E_inf cap + weak log-lambda prior
+                              # (see LAMBDA_PRIOR / PRIOR_SATURATION).
+                              # v1's log-linear P(t) + P_SLOPE_CAP is deleted
+                              # (see docs/MODEL-DECISION.md).
   MODEL = "logit-linear"      # shrunk OLS of logit(rate) on hours, fitted
                               # on the last 24 h of reads (not shipped).
   MODEL = "prior-shape"       # last rate x a baked per-tier shape factor
@@ -40,30 +43,20 @@ what ships:
 Override for local experiments only: MAKEFUN_MODEL=<name>. The grader runs
 with no environment, so the in-file MODEL is what ships.
 
-Spread (shared by all three models, so the models differ only in median):
-  sigma^2 = (0.5*sqrt(horizon_days))^2            random-walk term (house
-                                                   baseline's sigma)
-          + stale^2                              staleness term: the page
-                                                   can sit unchanged for
-                                                   hours while Exophase's
-                                                   next refresh jumps every
-                                                   rate (launch night: 638
-                                                   -> 3,868 players tracked
-                                                   at the 04:30Z refresh).
-                                                   stale = STALE_SIGMA *
-                                                   exp(-gap_hours /
-                                                   STALE_TAU), where
-                                                   gap_hours is the time
-                                                   since that trophy's rate
-                                                   last changed (or the whole
-                                                   history span if it never
-                                                   changed).
-          + (se_slope * horizon_hours)^2         trend-uncertainty term
-                                                   (logit-linear only).
-  sigma is capped at 2.5 logit units. On the flat practice histories every
-  model collapses to a carry-forward median (no movement to fit); only the
-  spread differs from the house baseline, which is exactly the point: a
-  refresh the history has not seen must be inside the forecast's band.
+Spread (v2): the quantiles are a BIMODAL mixture, not a symmetric band.
+The shipped model builds two scenarios per trophy -- no-refresh (P flat,
+earners grow; spread covers random walk + a fraction of the upside headroom
+to the E_inf cap rate) and refresh (P x R; spread adds the refresh-size
+uncertainty + an OVERDUE term that GROWS with the time since the last
+refresh, because a long flat stretch means a refresh is overdue). The lower
+quantiles come from the refresh mass, the upper quantiles from earner
+growth. The non-shipped models use spread_sigma (random walk + overdue +
+trend). The v1 staleness term is deleted: it narrowed the band exactly when
+a refresh was most overdue, which is backwards. On the flat practice
+histories every model collapses to a near-carry-forward median (no movement
+to fit, and the refresh probability over a 90-min horizon is small); only
+the band differs from the house baseline, which is exactly the point: a
+refresh the history has not seen must be inside the forecast's band.
 """
 
 import json
@@ -86,14 +79,64 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 MODEL = os.environ.get("MAKEFUN_MODEL", "poisson-hazard")
 MODELS = ("logit-linear", "poisson-hazard", "prior-shape")
 
-# --- shared spread parameters (FINAL: kept from provisional) ---------------
+# --- shared spread parameters (FINAL v2, 2026-11-19; see docs/MODEL-DECISION.md)
+# The spread is a BIMODAL mixture (refresh downside + earner upside), not a
+# symmetric band. The shipped model builds its quantiles from two scenarios
+# (no-refresh / refresh); the non-shipped models use spread_sigma below.
 SIGMA_RW = 0.5          # logit units per sqrt(day), house baseline's value.
-STALE_SIGMA = 1.5       # logit spread added when the page has not changed
-                        # at all (a refresh is overdue); decays as fresh
-                        # changes arrive.
-STALE_TAU_HOURS = 8.0   # staleness decay time.
 SIGMA_CAP = 2.5         # hard cap on total logit spread.
 SIGMA_FLOOR = 0.05      # never report a (near-)degenerate band.
+
+# --- refresh-event (denominator) model -- v2: P(t) as a scenario mixture ---
+# The tracked-player denominator moves by REFRESH EVENTS (steps), not smooth
+# drift: the launch-night refresh took 638 -> 3,868 players (x6.06) and cut
+# every rate by x0.165. A log-linear P(t) fit is the wrong family for a step
+# process, so the v2 model treats P as an event process: a refresh probability
+# p before the target and a refresh size R. The quantiles are the mixture of
+# a no-refresh scenario (P flat) and a refresh scenario (P x R). The median
+# shifts down when a refresh is likely and does not dilute when none is
+# expected. P_SLOPE_CAP (v1) is DELETED: the explicit scenario weight
+# replaces the uncalibrated slope cap.
+REFRESH_JUMP_RATIO = 1.5   # a P jump >= 1.5x between consecutive reads is a
+                           # refresh event (smooth growth between 10-30 min
+                           # reads is <1%; the observed jump is 6.06x).
+PRIOR_REFRESH_RATE = 1.0 / 24.0  # prior MEAN refresh rate, per hour (1/day).
+                           # The prior is Gamma(shape=ALPHA, rate=BETA_H),
+                           # so the posterior mean after n jumps in a span of
+                           # T hours is (ALPHA+n)/(BETA_H+T): a FLAT history
+                           # LOWERS the rate (evidence against refreshes) --
+                           # 0 jumps in 48h -> 1/72 per hour (0.33/day), not
+                           # 1/24. STATED ASSUMPTION: the one documented
+                           # refresh fell inside the first day; a stats site
+                           # refreshing daily is the standard cadence. No
+                           # launch-week refresh cadence exists to estimate
+                           # this from (Wayback 403; see docs).
+PRIOR_REFRESH_ALPHA = 1.0  # Gamma shape of the refresh-rate prior
+PRIOR_REFRESH_BETA_H = 24.0  # Gamma rate denominator (hours): prior mean 1/24
+PRIOR_REFRESH_SIZE = 3868.0 - 638.0  # 3230 players: the documented
+                           # launch-night refresh ADDED this many tracked
+                           # players. A DATA point (RULES.txt), not an
+                           # assumption. The refresh size is modelled as an
+                           # ADDITION (players newly tracked), not a ratio:
+                           # a ratio compounds absurdly (a second 6x jump
+                           # would take P to ~23k), while the number of
+                           # players a refresh newly tracks is roughly the
+                           # same order each time. The ratio R for a scenario
+                           # is (P_last + size) / P_last, so it shrinks as P
+                           # grows -- a second refresh dilutes far less than
+                           # the launch-night catch-up did.
+P_REFRESH_MAX = 0.95       # cap on the refresh probability: keep a small
+                           # no-refresh mass so the upper quantiles retain
+                           # the earner-growth scenario.
+SIZE_SIGMA = 0.5           # logit spread of the refresh SIZE inside the
+                           # refresh scenario (the next refresh's size is
+                           # uncertain; one observed size is one draw).
+OVERDUE_SIGMA = 1.0        # max spread added when a refresh is OVERDUE.
+OVERDUE_TAU_HOURS = 24.0   # overdue saturation time.
+HEADROOM_FRAC = 0.25       # fraction of the upside headroom (logit gap from
+                           # the last rate to the E_inf cap rate) covered by
+                           # the no-refresh scenario's spread, so the upper
+                           # quantiles can reach into the headroom.
 
 # --- logit-linear parameters (not shipped; kept for experiments) -----------
 FIT_WINDOW_HOURS = 24.0  # fit on the last 24 h of reads (house curve baseline).
@@ -159,17 +202,6 @@ E_INF_CAP_MULT = 1.5   # fitted E_inf may not exceed 1.5x the group's GTA V
                        # earner count -- whichever is larger.
 LAMBDA_PENALTY_W = 0.001  # weight of the weak log-lambda prior, in relative
                           # SSE units (see model_poisson_hazard).
-P_SLOPE_CAP = 0.01        # |log players-tracked/hour| cap on the P(t) fit.
-                          # The provisional 0.05/h lets P(t) explode: a
-                          # single early refresh jump (638 -> 3,868 in ~5 h)
-                          # gives a 48 h OLS slope near 0.04/h, which
-                          # extrapolates to ~100x players by day 7 and
-                          # collapses every median toward zero. 0.01/h still
-                          # allows 3.3x denominator growth over the 5-day
-                          # horizon (plausible launch-week surge) while
-                          # bounding the dilution. JUDGMENT CALL (no GTA V
-                          # P(t) curve exists to calibrate it) -- flagged in
-                          # docs/MODEL-DECISION.md.
 
 # --- prior-shape parameters (not shipped: all 1.0 = carry-forward) ---------
 # No credible week-one launch curve is baked in (see docs/MODEL-DECISION.md):
@@ -264,6 +296,110 @@ def ols(xs, ys):
     return (a, b, se_b, n)
 
 
+def norm_cdf(z: float) -> float:
+    """Standard normal CDF (via erf)."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _symmetric_qlgs(median_lg: float, sigma: float, levels):
+    """Quantile logits of a symmetric normal centred on median_lg."""
+    return [median_lg + norm_ppf(lv) * sigma for lv in levels]
+
+
+def _mixture_qlgs(mu_a: float, sig_a: float, mu_b: float, sig_b: float,
+                  p: float, levels):
+    """Quantile logits of a two-component normal mixture on the logit scale:
+    component A (no refresh) with weight 1-p, component B (refresh) with
+    weight p. Solved by bisection on the mixture CDF
+    F(x) = (1-p)*Phi((x-mu_a)/sig_a) + p*Phi((x-mu_b)/sig_b).
+    The result is BIMODAL in the right way: the lower quantiles come from
+    the refresh mass, the upper quantiles from the no-refresh mass."""
+    lo = min(mu_a, mu_b) - 8.0 * max(sig_a, sig_b)
+    hi = max(mu_a, mu_b) + 8.0 * max(sig_a, sig_b)
+    out = []
+    for lv in levels:
+        a, b = lo, hi
+        for _ in range(80):
+            m = 0.5 * (a + b)
+            f = (1.0 - p) * norm_cdf((m - mu_a) / sig_a) + \
+                p * norm_cdf((m - mu_b) / sig_b)
+            if f < lv:
+                a = m
+            else:
+                b = m
+        out.append(0.5 * (a + b))
+    return out
+
+
+def detect_refreshes(hist, release):
+    """Find refresh events in the players-tracked series: a STEP, not smooth
+    growth. A step is a jump of >= REFRESH_JUMP_RATIO between consecutive
+    reads that is ALSO much larger than the typical step (an outlier in the
+    log-increments). The typical-step test matters: smooth linear growth
+    from a small base looks like a big ratio jump (e.g. 638 -> 1038 is
+    x1.63) but is not a refresh. Returns a list of (hours_since_release,
+    ratio)."""
+    pts = []
+    for h in hist:
+        p = h.get("players_tracked")
+        if not p:
+            continue
+        t = (parse_time(h["at"]) - release).total_seconds() / 3600.0
+        pts.append((t, float(p)))
+    if len(pts) < 2:
+        return []
+    logsteps = [math.log(pts[i][1] / pts[i - 1][1])
+                for i in range(1, len(pts)) if pts[i - 1][1] > 0]
+    abssteps = sorted(abs(x) for x in logsteps)
+    med = abssteps[len(abssteps) // 2] if abssteps else 0.0
+    jumps = []
+    for i in range(1, len(pts)):
+        if pts[i - 1][1] <= 0:
+            continue
+        r = pts[i][1] / pts[i - 1][1]
+        lr = math.log(r)
+        if r >= REFRESH_JUMP_RATIO and lr >= 5.0 * max(med, 1e-9):
+            jumps.append((pts[i][0], r, pts[i][1] - pts[i - 1][1]))
+    return jumps
+
+
+def refresh_params(hist, horizon_h, t_at, release):
+    """Denominator event process: refresh probability p before the target,
+    refresh size (players ADDED by a refresh), hours since the last
+    refresh (gap), number of observed jumps, and E[N | N>=1] -- the
+    expected number of refreshes before the target GIVEN at least one
+    occurs (mu / (1 - exp(-mu)), mu = rate * horizon). The refresh
+    scenario's denominator is P_last + E[N|N>=1] * size, NOT P_last +
+    size: over a multi-day horizon several refreshes are expected, and
+    modelling only one UNDER-dilutes (the simulator caught this: the
+    single-refresh mixture lost to the old capped log-linear model even
+    when the refresh process matched the prior). The rate is the Gamma
+    posterior mean (ALPHA+n)/(BETA_H+span) -- a flat history lowers it.
+    The size is the median observed jump ADDITION, else the documented
+    launch-night addition (a DATA point)."""
+    jumps = detect_refreshes(hist, release)
+    t_first = (parse_time(hist[0]["at"]) - release).total_seconds() / 3600.0
+    t_last = (parse_time(hist[-1]["at"]) - release).total_seconds() / 3600.0
+    span = max(1.0, t_last - t_first)
+    rate = (PRIOR_REFRESH_ALPHA + len(jumps)) / (PRIOR_REFRESH_BETA_H + span)
+    if jumps:
+        adds = sorted(a for (_, _, a) in jumps)
+        size = adds[len(adds) // 2]
+        last_jump_t = jumps[-1][0]
+    else:
+        size = PRIOR_REFRESH_SIZE
+        last_jump_t = None
+    mu = rate * max(0.0, horizon_h)
+    p = 1.0 - math.exp(-mu)
+    p = min(P_REFRESH_MAX, max(0.0, p))
+    n_given = mu / p if p > 1e-9 else 1.0
+    if last_jump_t is None:
+        gap = max(0.0, t_at - t_first)
+    else:
+        gap = max(0.0, t_at - last_jump_t)
+    return p, size, gap, len(jumps), n_given
+
+
 # ---------------------------------------------------------------------------
 # Case parsing
 # ---------------------------------------------------------------------------
@@ -299,13 +435,21 @@ class TrophySeries:
 
 
 def spread_sigma(case, series, horizon_h, se_slope=0.0):
-    """Shared logit spread: random walk + staleness + trend uncertainty."""
+    """Shared logit spread for the non-shipped models: random walk +
+    refresh-overdue + trend uncertainty. The overdue term GROWS with the
+    time since the trophy's rate last changed -- a long flat stretch means
+    a refresh is overdue, so the band WIDENS. The v1 staleness term had
+    this backwards (it narrowed the band exactly when a refresh was most
+    overdue); it is deleted."""
     days = horizon_h / 24.0
     rw = SIGMA_RW * math.sqrt(days)
     gap = series.last_change_gap_h
-    stale = STALE_SIGMA * math.exp(-gap / STALE_TAU_HOURS) if gap is not None else STALE_SIGMA
+    if gap is None:
+        overdue = OVERDUE_SIGMA
+    else:
+        overdue = OVERDUE_SIGMA * (1.0 - math.exp(-gap / OVERDUE_TAU_HOURS))
     trend = abs(se_slope) * horizon_h
-    sigma = math.sqrt(rw * rw + stale * stale + trend * trend)
+    sigma = math.sqrt(rw * rw + overdue * overdue + trend * trend)
     return min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
 
 
@@ -315,7 +459,8 @@ def spread_sigma(case, series, horizon_h, se_slope=0.0):
 def model_logit_linear(case, series, horizon_h, t0):
     """Not shipped (see MODEL): shrunk OLS of logit(rate) on hours over the last
     FIT_WINDOW_HOURS of reads, extrapolated to the target. Flat history ->
-    slope 0 -> carry-forward median."""
+    slope 0 -> carry-forward median. Returns the quantile logits (symmetric)."""
+    levels = case.get("levels", LEVELS)
     t_end = (parse_time(case["at"]) - t0).total_seconds() / 3600.0
     pts = [(t, y) for (t, y) in series.points if t >= t_end - FIT_WINDOW_HOURS]
     if len(pts) < 3:
@@ -328,31 +473,40 @@ def model_logit_linear(case, series, horizon_h, t0):
         last_lg = logit(series.last_rate)
         median_lg = last_lg + slope * horizon_h
         median_lg = max(last_lg - MAX_SHIFT, min(last_lg + MAX_SHIFT, median_lg))
-        return median_lg, spread_sigma(case, series, horizon_h, se_slope=se_b)
+        return _symmetric_qlgs(median_lg,
+                               spread_sigma(case, series, horizon_h, se_slope=se_b),
+                               levels)
     if series.last_rate is not None:
-        return logit(series.last_rate), spread_sigma(case, series, horizon_h)
-    return logit(1.0), SIGMA_CAP  # no observations at all: wide, centred low
+        return _symmetric_qlgs(logit(series.last_rate),
+                               spread_sigma(case, series, horizon_h), levels)
+    return _symmetric_qlgs(logit(1.0), SIGMA_CAP, levels)  # no observations
+    # at all: wide, centred low
 
 
 def model_poisson_hazard(case, series, horizon_h, t0):
-    """Decaying-hazard fit on earner COUNTS, regularized by a GTA V prior
-    (FINAL -- see docs/MODEL-DECISION.md). E(t) = E_inf * (1 - exp(-lam*t)),
-    t hours since release; lam picked by penalized least squares over a grid,
-    E_inf by linear scale at that lam. P(t) is forecast by log-linear fit on
-    players_tracked. Rate = 100 * E / P -- so the median shifts DOWN when the
-    tracked-player denominator grows (the refresh mechanism, modelled
-    explicitly, not an ad-hoc offset). The GTA V prior enters twice:
-    (1) a hard cap E_inf <= max(E_last, E_INF_CAP_MULT * S_group * P_target),
-    where S_group is the GTA V median long-run saturation of the trophy's
-    type (Exophase PS3) -- the cap bounds extrapolated growth, never the
-    observed level; (2) a weak log-lambda penalty pulling lam toward the
-    group's prior centre, which only breaks ties on flat history and is
-    overruled by real movement. Flat history -> saturated fit, E_inf ~ E_last,
-    P ~ P_last: carry-forward."""
+    """Poisson-hazard fit on earner COUNTS + denominator as a SCENARIO
+    MIXTURE (v2 -- see docs/MODEL-DECISION.md). E(t) = E_inf * (1 - exp(-lam*t)),
+    lam picked by penalized least squares over a grid, E_inf by linear scale
+    at that lam, with the GTA V prior (hard E_inf cap + weak log-lambda
+    penalty). The denominator is NOT fit log-linearly (that is the wrong
+    family for a step process, and the v1 P_SLOPE_CAP moved the median by
+    ~1 logit through an uncalibrated constant): instead the refresh
+    probability p and size R come from refresh_params(), and the quantiles
+    are the mixture of a no-refresh scenario (P flat, earners grow) and a
+    refresh scenario (P + refresh_add players, earners grow) -- BIMODAL, lower quantiles from
+    the refresh mass, upper quantiles from earner growth. The median shifts
+    down when a refresh is likely and does not dilute when none is expected.
+    The refresh scenario's spread adds the refresh-size uncertainty and the
+    OVERDUE term (a long flat stretch widens the band -- the v1 staleness
+    term had this backwards). The no-refresh scenario's spread covers a
+    fraction of the upside headroom to the E_inf cap rate. Flat history ->
+    the earners fit saturates and, on a short horizon, p is small, so the
+    median stays near carry-forward. Returns the quantile logits."""
     release = parse_time(case.get("game", {}).get("release_date", case["history"][0]["at"]))
     hist = case["history"]
+    levels = case.get("levels", LEVELS)
     if series.last_rate is None or not hist:
-        return logit(1.0), SIGMA_CAP
+        return _symmetric_qlgs(logit(1.0), SIGMA_CAP, levels)
     # GTA V prior group for this trophy (by id; default "side").
     tid = case["trophies"][series.idx].get("id", 0)
     group = TROPHY_PRIOR.get(tid, "side")
@@ -372,20 +526,23 @@ def model_poisson_hazard(case, series, horizon_h, t0):
             continue
         obs.append((t, float(rates[series.idx]) / 100.0 * float(players)))
     if len(obs) < 2:
-        return logit(series.last_rate), spread_sigma(case, series, horizon_h)
-    # Players-tracked forecast first: the E_inf cap is a rate cap at target.
+        return _symmetric_qlgs(logit(series.last_rate),
+                               spread_sigma(case, series, horizon_h), levels)
+    # Denominator event process (scenario mixture -- replaces log-linear P(t)).
     t_target = (parse_time(case["target"]) - release).total_seconds() / 3600.0
-    p_pts = [((parse_time(h["at"]) - release).total_seconds() / 3600.0,
-              math.log(float(h["players_tracked"])))
-             for h in hist if h.get("players_tracked")]
-    p_target = float(hist[-1]["players_tracked"])
-    if len(p_pts) >= 2:
-        _, b, _, _ = ols([t for (t, _) in p_pts], [y for (_, y) in p_pts])
-        b = max(-P_SLOPE_CAP, min(P_SLOPE_CAP, b))
-        t_last = p_pts[-1][0]
-        p_target = math.exp(math.log(p_target) + b * max(0.0, t_target - t_last))
-        p_target = max(p_target, 1.0)
-    e_inf_cap = max(obs[-1][1], E_INF_CAP_MULT * sat * p_target)
+    t_at = (parse_time(case["at"]) - release).total_seconds() / 3600.0
+    p_last = float(hist[-1]["players_tracked"])
+    p_refresh, refresh_add, gap_refresh, _nj, n_given = refresh_params(
+        hist, horizon_h, t_at, release)
+    # Refresh ratio for this trophy's P_last: the refresh scenario expects
+    # E[N|N>=1] refreshes before the target, each ADDING refresh_add
+    # players, so the ratio shrinks as P grows (a second refresh dilutes
+    # far less than the launch-night catch-up did).
+    refresh_ratio = (p_last + n_given * refresh_add) / max(p_last, 1.0)
+    # E_inf cap is a rate cap at the NO-refresh target (P flat): the earners
+    # can grow up to the cap regardless of which denominator scenario holds.
+    # Using P_last is the binding (conservative) form of the cap.
+    e_inf_cap = max(obs[-1][1], E_INF_CAP_MULT * sat * p_last)
     mean_e = sum(e for (_, e) in obs) / len(obs)
     scale = len(obs) * mean_e * mean_e if mean_e > 0 else 0.0
     best = None
@@ -411,23 +568,41 @@ def model_poisson_hazard(case, series, horizon_h, t0):
             best = (rel, lam, e_inf)
     if best is None:
         # Every grid point violated the cap: fall back to carry-forward.
-        return logit(series.last_rate), spread_sigma(case, series, horizon_h)
+        return _symmetric_qlgs(logit(series.last_rate),
+                               spread_sigma(case, series, horizon_h), levels)
     _, lam, e_inf = best
     e_target = e_inf * (1.0 - math.exp(-lam * max(t_target, 0.0)))
-    rate = clamp(100.0 * max(e_target, 0.0) / p_target)
-    return logit(rate), spread_sigma(case, series, horizon_h)
+    # --- scenario A: no refresh (P flat) ----------------------------------
+    rate_a = clamp(100.0 * max(e_target, 0.0) / max(p_last, 1.0))
+    mu_a = logit(rate_a)
+    # Upside headroom: the earners can grow up to the cap rate.
+    cap_rate = clamp(100.0 * e_inf_cap / max(p_last, 1.0))
+    headroom = max(0.0, logit(cap_rate) - logit(series.last_rate))
+    rw = SIGMA_RW * math.sqrt(horizon_h / 24.0)
+    sig_a = math.sqrt(rw * rw + (HEADROOM_FRAC * headroom) ** 2)
+    sig_a = min(SIGMA_CAP, max(SIGMA_FLOOR, sig_a))
+    # --- scenario B: refresh (P + refresh_add) -----------------------------
+    rate_b = clamp(100.0 * max(e_target, 0.0) / max(p_last * refresh_ratio, 1.0))
+    mu_b = logit(rate_b)
+    overdue = OVERDUE_SIGMA * (1.0 - math.exp(-gap_refresh / OVERDUE_TAU_HOURS))
+    sig_b = math.sqrt(sig_a * sig_a + SIZE_SIGMA * SIZE_SIGMA + overdue * overdue)
+    sig_b = min(SIGMA_CAP, max(SIGMA_FLOOR, sig_b))
+    return _mixture_qlgs(mu_a, sig_a, mu_b, sig_b, p_refresh, levels)
 
 
 def model_prior_shape(case, series, horizon_h, t0):
     """Baked shape prior: last rate x per-tier factor. All factors are 1.0
     (carry-forward) because no credible week-one launch curve exists to bake
     in -- cumulative GTA IV/V rarities are long-run equilibria, the wrong
-    object for a 4.5-day forecast. See docs/MODEL-DECISION.md."""
+    object for a 4.5-day forecast. See docs/MODEL-DECISION.md. Returns the
+    quantile logits (symmetric)."""
+    levels = case.get("levels", LEVELS)
     tier = case["trophies"][series.idx].get("tier", "bronze")
     factor = SHAPE_FACTOR.get(tier, 1.0)
     if series.last_rate is not None:
-        return logit(clamp(series.last_rate * factor)), spread_sigma(case, series, horizon_h)
-    return logit(1.0), SIGMA_CAP
+        return _symmetric_qlgs(logit(clamp(series.last_rate * factor)),
+                               spread_sigma(case, series, horizon_h), levels)
+    return _symmetric_qlgs(logit(1.0), SIGMA_CAP, levels)
 
 
 MODELS_FN = {
@@ -446,7 +621,6 @@ def forecast_case(case, name):
     if not case.get("history"):
         raise ValueError(f"{name} has no history")
     levels = case.get("levels", LEVELS)
-    zs = [norm_ppf(lv) for lv in levels]
     horizon_h = float(case["horizon_minutes"]) / 60.0
     t0 = parse_time(case["history"][0]["at"])
     fn = MODELS_FN[MODEL]
@@ -466,13 +640,13 @@ def forecast_case(case, name):
         s = series_list[i]
         if s.last_rate is None:
             # Never observed: centre on the cross-trophy median, widest band.
-            median_lg, sigma = logit(fallback_rate), SIGMA_CAP
+            qlgs = _symmetric_qlgs(logit(fallback_rate), SIGMA_CAP, levels)
         else:
-            median_lg, sigma = fn(case, s, horizon_h, t0)
+            qlgs = fn(case, s, horizon_h, t0)
         qs = []
         prev = None
-        for z in zs:
-            q = round4(clamp(sigmoid(median_lg + z * sigma), 0.0, 100.0))
+        for lg in qlgs:
+            q = round4(clamp(sigmoid(lg), 0.0, 100.0))
             # Keep quantiles non-decreasing after rounding.
             if prev is not None and q < prev:
                 q = prev

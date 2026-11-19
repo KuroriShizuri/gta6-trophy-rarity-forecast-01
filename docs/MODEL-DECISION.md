@@ -1,37 +1,84 @@
 # Keputusan model — gta6-trophy-rarity-forecast-01
 
-**Status: FINAL (2026-11-19).** Keputusan user (18:47 WIB): *"1,2,3,4,5 kamu harus
-jawab berdasarkan data gta 5. Karena itu satu satunya data prior yang ada."*
-Semua lima pertanyaan dijawab dari data GTA V. Terimplementasi di `main.py`:
-`MODEL = "poisson-hazard"` + prior GTA V per tipe (`TROPHY_PRIOR`,
-`PRIOR_SATURATION`, `LAMBDA_PRIOR`, `E_INF_CAP_MULT`, `LAMBDA_PENALTY_W`,
-`P_SLOPE_CAP`). Mengganti model = mengubah konstanta + parameter itu — tidak
-ada restruktur kode.
+**Status: FINAL v2 (2026-11-19).** Revisi dari FINAL v1 mengikuti review
+Claude Sonnet 5.5 pasca-submit (19:26 WIB, sesi Kiro 03864765, 0,49 kredit;
+Sonnet menilai dari dokumen ini saja — main.py tidak bisa dilampirkan).
+Keputusan user (19:29 WIB): *"Bisa direvisi bisa bertahan, ikutin panduan
+sonnet pokok nya."* Revisi ini menggantikan submission 01a1f3bd (claim
+AF-BJGHA) — submission lama tetap jadi fallback sampai revisi ini terverifikasi.
 
-## Keputusan final (ringkasan)
+**Yang berubah di v2 (per poin Sonnet):**
+1. **Data launch-curve dicoba lagi, gagal, didokumentasikan.** Wayback CDX API
+   403 (jangan di-retry — runtime melarang), PSNProfiles/TrueTrophies tidak
+   punya time series. λ0 tetap asumsi (lihat §1).
+2. **P(t) jadi scenario mixture** (bukan log-linear + P_SLOPE_CAP).
+   P_SLOPE_CAP DIHAPUS. Penyebut dimodelkan sebagai proses EVENT: probabilitas
+   refresh + ukuran refresh (aditif, 3.230 pemain — data dari lompatan
+   638→3.868). Kuantil bawah dari massa refresh, kuantil atas dari
+   pertumbuhan earners. Median turun kalau refresh mungkin, tidak turun kalau
+   tidak ada refresh yang diharapkan.
+3. **Arah staleness diperbaiki.** Suku lama (1,5·exp(−gap/8 jam)) yang
+   MENYEMPITKAN band untuk trofi dormant DIHAPUS. Diganti suku overdue yang
+   MELEBAR saat refresh makin overdue + suku headroom-ke-saturasi. Spread
+   jadi campuran BIMODAL (refresh downside + earner upside), bukan band
+   simetris.
+4. **Dipertahankan:** median poisson-hazard untuk earners (dekomposisi
+   rate = earners/tracked benar), cap E_inf + penalti log-λ lemah, prior
+   bentuk GTA V untuk cap.
+5. **Simulator refresh dibangun** (`../sim-refresh.py`) dan dijalankan
+   SEBELUM finalisasi — hasilnya di bawah.
 
-**Kombinasi: median poisson-hazard + prior GTA V + spread bersama.**
-Median dari model poisson-hazard (satu-satunya keluarga yang memodelkan
-pembilang dan penyebut secara terpisah — mekanisme refresh), diregularisasi
-oleh prior GTA V: (a) cap keras E_inf per tipe dari saturasi GTA V, (b) penalti
-log-λ lemah menuju pusat prior per tipe. Spread dipertahankan dari provisional
-(STALE_SIGMA=1,5 / STALE_TAU=8 jam). Median BOLEH turun mengantisipasi
-refresh, tapi lewat mekanisme eksplisit P(t) di model poisson — bukan offset
-ad-hoc — dan laju pertumbuhan P(t) dibatasi cap 0,01/jam.
+Implementasi di `main.py`: `MODEL = "poisson-hazard"` + prior GTA V
+(`TROPHY_PRIOR`, `PRIOR_SATURATION`, `LAMBDA_PRIOR`, `E_INF_CAP_MULT`,
+`LAMBDA_PENALTY_W`) + mixture penyebut (`REFRESH_JUMP_RATIO`,
+`PRIOR_REFRESH_RATE/ALPHA/BETA_H`, `PRIOR_REFRESH_SIZE`, `P_REFRESH_MAX`,
+`SIZE_SIGMA`, `OVERDUE_SIGMA/TAU_HOURS`, `HEADROOM_FRAC`, `SIGMA_RW/CAP/FLOOR`).
+Konstanta v1 yang DIHAPUS: `P_SLOPE_CAP`, `STALE_SIGMA`, `STALE_TAU`.
 
-## Sumber data GTA V (diambil 2026-11-19)
+## Keputusan final v2 (ringkasan)
+
+**Kombinasi: median poisson-hazard + prior GTA V + scenario mixture untuk P(t)
++ spread bimodal.** Median dari model poisson-hazard (satu-satunya keluarga
+yang memodelkan pembilang dan penyebut secara terpisah), diregularisasi prior
+GTA V (cap E_inf + penalti log-λ). Penyebut TIDAK lagi di-fit log-linear:
+ia adalah campuran dua skenario — (A) tidak ada refresh (P datar, earners
+tumbuh) dan (B) refresh (P + N×3.230 pemain, earners tumbuh) — dengan bobot
+p = probabilitas ≥1 refresh sebelum target. Kuantil dihitung dari CDF
+campuran (bisection), jadi kuantil bawah ditarik massa refresh dan kuantil
+atas ditarik pertumbuhan earners. Spread adalah campuran bimodal, bukan band
+simetris yang dilebarkan dua arah.
+
+## 1. Data launch-curve: dicoba lagi, tidak ada yang bisa diambil
+
+Sonnet meminta data yang bisa membedakan model SEBELUM memilih model — sumber
+satu-satunya kurva launch adalah snapshot Wayback 2013-10-29 halaman Exophase
+GTA V PS3. Yang dicoba (bounded effort, 2026-11-19):
+- **Wayback CDX API** (`web.archive.org/cdx/search/cdx?...`): HTTP **403
+  (access denied)**. Runtime menginstruksikan TIDAK me-retry (termasuk dengan
+  argumen berbeda atau lewat tool/endpoint lain) dan tidak melewati penolakan
+  — jadi bentuk URL `id_` suffix TIDAK dicoba (penolakan yang sama).
+- **PSNProfiles / TrueTrophies** (pencarian web): keduanya hanya menerbitkan
+  rarity SAAT INI, bukan time series. PocketPSN menampilkan persentase saat
+  ini + tanggal first-earned, bukan kurva populasi.
+- **Game terbaru dengan history launch-week:** tidak ada sumber yang
+  menerbitkan kurva rarity minggu pertama yang bisa diambil.
+
+**Kesimpulan: TIDAK ADA data launch-curve yang bisa diambil.** λ0 tetap
+ASUMSI (τ dari sifat konten, penalti lemah 0,001 hanya pemutus seri) — tidak
+teridentifikasi dari data GTA V saja (rarity kumulatif hari ini adalah satu
+titik = E_inf; kurva launch butuh ≥2 titik). Ini dinyatakan eksplisit di
+flag di bawah, bukan disembunyikan.
+
+## Sumber data GTA V (diambil 2026-11-19) — tidak berubah dari v1
 
 **Sumber: Exophase GTA V PS3** — `https://www.exophase.com/game/grand-theft-auto-v-ps3/trophies/`
 (daftar launch-era, 50 trofi dasar). Halaman PSN/PS5 juga diambil sebagai
 pembanding (78 trofi; populasi PS5 condong ke Online, jadi PS3 yang dipakai).
 **Yang data ini ADALAH:** rarity kumulatif HARI INI (ekuilibrium 13 tahun),
-per trofi. **Yang BUKAN:** kurva minggu pertama — tidak ada snapshot
-launch-week yang bisa diambil: Wayback Machine PUNYA snapshot halaman
-Exophase PS3 per 2013-10-29 (6 minggu pasca-rilis), tapi fetch-nya ditolak
-(403) dan tidak diulang. Jadi tidak ada λ / kurva minggu pertama dari GTA V;
-yang dipakai dari GTA V adalah **level saturasi per tipe + pengelompokan
-tipe**, dan level dipakai sebagai SHAPE prior (bukan level — level tetap dari
-rate GTA VI sendiri).
+per trofi. **Yang BUKAN:** kurva minggu pertama (lihat §1 — tidak bisa
+diambil). Yang dipakai dari GTA V adalah **level saturasi per tipe +
+pengelompokan tipe**, dan level dipakai sebagai SHAPE prior (bukan level —
+level tetap dari rate GTA VI sendiri).
 
 Tabel saturasi GTA V (median rarity kumulatif PS3 per kelompok analog):
 
@@ -56,7 +103,7 @@ story +4,74; robbery +4,82; side +3,14; collectible +2,38; grind +1,86;
 platinum +1,29. Sisi bawah (refresh yang teramati 638→3.868, faktor 0,165):
 −1,81 logit pada rate 1,1%; −2,41 pada rate 50%.
 
-## Fakta data yang membatasi semua opsi
+## Fakta data yang membatasi semua opsi — tidak berubah dari v1
 
 1. **History practice datar total.** Semua read di p00/p01 identik: 638 pemain
    terlacak, semua 55 rate sama, dari 2026-11-18T23:50Z sampai checkpoint.
@@ -82,153 +129,225 @@ platinum +1,29. Sisi bawah (refresh yang teramati 638→3.868, faktor 0,165):
    jawaban itu sendiri. Angka backtest di bawah adalah angka-vs-proxy, dan
    dilaporkan apa adanya sebagai proxy.
 
-## Jawaban lima pertanyaan (dari data GTA V)
+## 2. P(t) sebagai scenario mixture (perubahan utama v2)
 
-### 1. Keluarga model final: KOMBINASI — median poisson-hazard + prior GTA V
-Median dari poisson-hazard (E(t) = E_inf·(1−exp(−λt)) pada jumlah earners +
-forecast P(t) log-linear), diregularisasi prior GTA V (poin 2), dengan spread
-bersama dari logit-linear (random walk + staleness + ketidakpastian tren).
-Alasan dari data GTA V: (a) saturasi per tipe GTA V adalah objek yang
-persis dimodelkan E_inf — prior dan model bicara tentang besaran yang sama;
-(b) poisson satu-satunya keluarga yang memisahkan earners dari tracked
-players, jadi arah efek refresh (poin 5) dimodelkan, bukan ditampung spread;
-(c) bentuknya jenuh (asymptote E_inf) sehingga tidak overshoot seperti garis
-lurus logit-linear pada horizon 4,5 hari. Logit-linear TIDAK dipakai untuk
-median (ekstrapolasi garis lurus 4,5 hari overshoot trofi yang jenuh cepat);
-prior-shape TIDAK dipakai sebagai keluarga (faktor bentuk butuh kurva minggu
-pertama yang tidak ada — memakai rarity kumulatif sebagai level adalah
-kesalahan objek, lihat Opsi 3 lama).
+**Log-linear P(t) + P_SLOPE_CAP DIHAPUS.** Penyebut adalah proses EVENT:
 
-### 2. Bentuk hazard + regularisasi λ per tier: eksponensial tunggal + cap E_inf + penalti log-λ
-Bentuk hazard: **eksponensial tunggal** E(t) = E_inf·(1−exp(−λt)), seperti
-yang sudah terimplementasi (grid λ 10^−4–10^2/jam). Dua-fase/power-law tidak
-dipakai: tidak ada data launch-week untuk membedakan bentuk, dan satu
-parameter λ per trofi sudah cukup dengan regularisasi.
-Regularisasi per kelompok (dua lapis):
-- **Cap keras E_inf** (lapis utama, menghilangkan sudut degenerat):
-  E_inf ≤ max(E_last, 1,5 × S_kelompok × P_target). S dari tabel GTA V di
-  atas. Cap ini membunuh mode kegagalan "λ kecil + E_inf raksasa → forecast
-  naik ~25% palsu" — tanpa menyentuh level yang sudah teramati (E_last selalu
-  lolos). Sebagai cap rate: story 84%, robbery 87%, side 31%, collectible
-  16%, grind 10%, platinum 5,9%.
-- **Penalti log-λ lemah** (lapis kedua, pemutus seri): skor pemilihan =
-  SSE/(n·mean_e²) + 0,001·(log10 λ − log10 λ0)², dengan λ0 per kelompok:
-  story 0,0417; robbery 0,0208; side 0,0139; collectible 0,0060; grind
-  0,0030; platinum 0,0014 per jam (τ = 1/λ0 = 24 jam / 48 jam / 72 jam /
-  7 hari / 14 hari / 30 hari — waktu menuju 63% saturasi).
-  **λ0 adalah ASUMSI yang dinyatakan eksplisit, bukan data GTA V** (tidak ada
-  kurva launch-week untuk mengestimasinya; lihat flag di bawah). Bobotnya
-  sengaja lemah: hanya memutus seri pada history datar (di sana semua λ
-  jenuh memberi SSE=0) dan dikalahkan data begitu ada gerakan nyata.
-  Verifikasi: pada history sintetis yang naik (earners 2x tiap 12 jam),
-  median story 33,76% (cap 84%, tidak mengikat) dan median grind 9,14%
-  (cap 10%, MENGIKAT — persis fungsi prior).
+- **Deteksi refresh (adaptif).** `detect_refreshes()` menemukan lompatan P:
+  sebuah langkah dihitung refresh hanya jika rasionya ≥1,5x DAN log-increment-
+  nya ≥5× median |log-step| history. Syarat kedua ini penting: pertumbuhan
+  halus dari basis kecil (mis. 638→1.038, ×1,627) BUKAN refresh — detektor
+  lama (rasio saja) salah menandainya refresh dan over-dilusi 95%.
+  Lompatan 6,06x yang teramati pada history datar lolos kedua syarat.
+- **Probabilitas refresh p.** Refresh adalah proses Poisson dengan rate λ.
+  Rate adalah **posterior mean Gamma** (shape=ALPHA, rate=BETA_H):
+  λ = (ALPHA + n_lompatan) / (BETA_H + span_jam). Prior: ALPHA=1, BETA_H=24
+  jam → mean prior 1/hari (STATED ASSUMPTION — satu refresh per hari adalah
+  kadensi launch-night; tidak ada kadensi launch-week yang bisa diestimasi).
+  History datar MENURUNKAN rate (bukti melawan refresh): 0 lompatan dalam
+  48 jam → λ = 1/72 per jam (0,33/hari), bukan 1/24. p = 1−exp(−λ·horizon),
+  di-cap 0,95.
+- **Ukuran refresh: ADITIF, bukan rasio.** Refresh MENAMBAH pemain yang baru
+  terlacak. Ukuran = median penambahan yang teramati (per lompatan), kalau
+  tidak ada lompatan = **3.230 pemain** (3.868−638 — DATA dari lompatan
+  launch-night, bukan asumsi). Bentuk aditif dipilih karena rasio
+  meng-compound secara absurd (refresh kedua ×6 akan membawa P ke ~23 ribu);
+  jumlah pemain yang baru terlacak per refresh kira-kira seorde tiap kali.
+  Rasio skenario R = (P_last + N·ukuran) / P_last — menyusut saat P tumbuh,
+  jadi refresh kedua mendilusi jauh lebih sedikit dari catch-up launch-night.
+- **Jumlah refresh yang diharapkan.** Skenario refresh TIDAK hanya satu
+  refresh: ia memakai E[N | N≥1] = μ/(1−exp(−μ)), μ = λ·horizon — jumlah
+  refresh yang diharapkan SEBELUM target kalau setidaknya satu terjadi.
+  Ini ditemukan simulator: mixture satu-refresh UNDER-dilusi dan kalah dari
+  log-linear lama yang di-cap, bahkan saat proses refresh cocok dengan prior.
+  Untuk horizon 4,5 hari dengan λ≈1/hari, E[N|N≥1]≈4,5.
+- **Kuantil dari CDF campuran (bimodal).** Kuantil q adalah solusi bisection
+  dari (1−p)·Φ((q−μ_A)/σ_A) + p·Φ((q−μ_B)/σ_B) = level, dengan μ_A =
+  logit rate tanpa refresh, μ_B = logit rate dengan refresh. Kuantil bawah
+  ditarik massa refresh, kuantil atas ditarik pertumbuhan earners.
+  **Angka practice:** p00/p01: lompatan=0, p=0,055, ukuran=3.230,
+  E[N|N≥1]=1,03, rasio=6,21, gap=3,15/3,65 jam. **Angka final-like**
+  (history 48 jam dengan lompatan 6x): lompatan=1, p=0,95, ukuran=3.230,
+  E[N|N≥1]=3,17, rasio=3,65, gap=43,5 jam.
+- **Median bergeser turun kalau refresh mungkin, tidak kalau tidak.**
+  Pada practice (p≈0,05) median ≈ carry-forward (id4 median 1,03% vs last
+  1,1%). Pada final-like (p=0,95) median terdilusi ~3,4x (id4 story median
+  0,053% vs last 0,18% pada earners datar — angka ini naik kalau earners
+  tumbuh, seperti di final sungguhan).
 
-### 3. Prior-shape: sumber + pemakaian — Exophase PS3, SHAPE ONLY
-Sumber: **Exophase GTA V PS3** (tabel di atas), dipakai sebagai **shape only**:
-level saturasi per tipe mengatur cap + penalti λ di dalam model poisson,
-sementara LEVEL forecast tetap dari rate GTA VI sendiri. TIDAK dipakai sebagai
-level (tidak ada faktor pengali rate dari rarity kumulatif — itu menarik
-forecast ke ekuilibrium 13 tahun, objek yang salah untuk horizon 7 hari).
-Tidak ada kurva minggu pertama yang di-bake (Wayback 2013-10-29 tidak bisa
-diambil). Model `prior-shape` di kode tetap carry-forward (faktor 1,0) dan
-tidak dipakai sebagai keluarga final.
+## 3. Spread: arah staleness diperbaiki, bimodal (perubahan v2)
 
-### 4. Kalibrasi spread: DIPERTAHANKAN — STALE_SIGMA=1,5 / STALE_TAU=8 jam
-Dari data GTA V + refresh teramati: sisi bawah refresh −1,81 logit (rate
-1,1%) sampai −2,41 (rate 50%) muat di dalam kuantil 5% pada σ≈1,0–1,5; sisi
-atas headroom ke saturasi +1,29 (platinum) sampai +4,82 (robbery) logit
-menuntut band yang lebar ke atas — σ di bawah ~1,0 membiarkan upside trofi
-yang tumbuh tidak tertutup. Sensitivitas vs proxy: σ 1,02 → 1,0742; σ 1,49 →
-0,9710; σ 2,02 → 0,9367 — loss vs proxy terus turun, TAPI itu artefak proxy
-(proxy = batas bawah ekstrem; jawaban sebenarnya lebih tinggi, jadi σ
-optimal sebenarnya lebih kecil dari σ-optimal-vs-proxy). σ≈1,02 (provisional)
-berada di zona yang benar; melebarkan ke σ≈2 berarti over-wide di final.
-Karena itu 1,5/8 jam dipertahankan. (Catatan flag: suku staleness menyempit
-untuk trofi yang lama tidak berubah — lihat flag di bawah.)
+**Suku staleness lama DIHAPUS** (STALE_SIGMA/STALE_TAU). Suku itu menyempitkan
+band saat trofi dormant — arah yang salah untuk risiko refresh (rentang datar
+yang panjang berarti refresh PALING overdue). Diganti dua suku:
 
-### 5. Median BOLEH turun mengantisipasi refresh — lewat P(t), bukan offset
-**Ya, median digeser turun — tapi lewat mekanisme eksplisit model poisson:**
-rate forecast = 100·E(t_target)/P(t_target), dengan P(t) di-fit log-linear
-pada players_tracked. Ketika penyebut tumbuh, median turun sebesar itu
-dengan sendirinya; tidak ada offset ad-hoc. Bukti arah dari data GTA VI
-sendiri (bukan GTA V — GTA V tidak punya event refresh yang teramati):
-refresh 638→3.868 menurunkan semua rate dengan faktor 0,165. Besaran
-pergeseran sepenuhnya data-driven dari history 48 jam final: kalau P(t)
-datar di final, tidak ada pergeseran (benar — tidak ada refresh, tidak ada
-dilusi). **Batas pengaman (temuan diagnostik):** fit log-linear P(t) pada
-lompatan refresh awal memberi slope ~0,04/jam yang diekstrapolasi jadi
-~100x pemain di hari ke-7 dan meruntuhkan semua median ke ~0 (terukur di
-diagnostik sintetis: median 0,086% vs last rate 2,93%). Karena itu slope
-P(t) di-cap **P_SLOPE_CAP = 0,01/jam** (mengizinkan 3,3x pertumbuhan
-penyebut selama horizon 5 hari — lonjakan launch-week yang masuk akal —
-sambil membatasi dilusi). Setelah cap: median sintetis 2,29% vs last rate
-2,93% — dilusi termodelkan, tidak runtuh. **Cap ini judgment call** (tidak
-ada kurva P(t) GTA V untuk mengkalibrasinya) — di-flag di bawah.
+- **Suku overdue (tumbuh saat dormant):**
+  σ_overdue = OVERDUE_SIGMA·(1−exp(−gap/OVERDUE_TAU_HOURS)), OVERDUE_SIGMA=1,0,
+  OVERDUE_TAU_HOURS=24 jam. gap = jam sejak refresh terakhir (atau sejak
+  read pertama kalau belum ada refresh). Dormant = spread LEBIH besar untuk
+  risiko refresh, bukan lebih kecil.
+- **Suku headroom-ke-saturasi (skenario A):** σ_A menampung random walk
+  (SIGMA_RW=0,5) + sebagian headroom logit ke cap rate E_inf
+  (HEADROOM_FRAC=0,25 × headroom_logit). Trofi yang jauh dari saturasi
+  mendapat band atas yang lebih lebar; trofi yang dekat saturasi tidak.
+- **Skenario B (refresh):** σ_B = sqrt(σ_A² + SIZE_SIGMA² + σ_overdue²),
+  SIZE_SIGMA=0,5 (ketidakpastian ukuran refresh — satu ukuran yang teramati
+  adalah satu draw). σ di-floor 0,05, di-cap 2,5 (SIGMA_FLOOR/CAP).
+- **Hasilnya bimodal, bukan simetris:** kuantil bawah mencapai drop refresh
+  (−1,8 sampai −2,4 logit pada 5%), kuantil atas mencapai headroom earners
+  (+1,3 sampai +4,8 logit). Band simetris yang dilebarkan dua arah akan
+  membuang massa di tengah yang tidak dibutuhkan.
 
-## Hasil backtest FINAL (vs PROXY jawaban "frozen earners", p00+p01 digabung)
+## 4. Yang dipertahankan (Sonnet: ini baik-baik saja)
+
+- **Median poisson-hazard untuk earners.** E(t) = E_inf·(1−exp(−λt)) pada
+  jumlah earners, grid λ 10^−4–10^2/jam. Dekomposisi rate = earners/tracked
+  benar; hazard satu-satunya keluarga yang memisahkan pembilang dari penyebut.
+- **Cap E_inf + penalti log-λ lemah.** Cap keras E_inf ≤
+  max(E_last, 1,5 × S_kelompok × P_last) — v2 memakai P_last (bentuk yang
+  mengikat/konservatif), bukan P_target. Sebagai cap rate: story 84%,
+  robbery 87%, side 31%, collectible 16%, grind 10%, platinum 5,9%.
+  Penalti log-λ: SSE/(n·mean_e²) + 0,001·(log10 λ − log10 λ0)², λ0 per
+  kelompok: story 0,0417; robbery 0,0208; side 0,0139; collectible 0,0060;
+  grind 0,0030; platinum 0,0014 per jam (τ 24 jam / 48 jam / 72 jam /
+  7 hari / 14 hari / 30 hari). **λ0 adalah ASUMSI yang dinyatakan eksplisit**
+  (lihat §1 — tidak ada kurva launch-week untuk mengestimasinya).
+- **Prior bentuk GTA V untuk cap.** Exophase PS3, shape only (lihat tabel
+  di atas). Model `prior-shape` di kode tetap carry-forward (faktor 1,0)
+  dan tidak dipakai sebagai keluarga final.
+
+## 5. Simulator / held-out check untuk proses penyebut (baru di v2)
+
+`../sim-refresh.py` (bukan bagian entry): mensimulasikan proses refresh yang
+DIKETAHUI (seeded RNG) — earners mengikuti hazard dengan λ_true yang
+dipilih supaya rate di t=4 jam cocok dengan last rate p00 sungguhan, dan
+P(t) mengikuti proses Poisson refresh (tiap refresh MENAMBAH pemain,
+A ~ LogNormal(median=A_med, σ=0,4)). History 48 jam (read tiap 30 menit),
+target +108 jam (horizon final). Dibandingkan model BARU (v2) vs model LAMA
+(v1, dari `git show f22a527:main.py`) pada kasus sintetis yang sama — mean
+pinball loss skala logit vs rate target SEBENARNYA + coverage band 90% +
+|logit median error|. 4 skenario × 6 seed. Ukuran refresh simulator BERBEDA
+dari asumsi model di S2/S3 (anti-sirkularitas: model tidak diuji pada
+asumsinya sendiri).
+
+| skenario (proses refresh sebenarnya) | pinball baru (v2) | pinball lama (v1) | coverage90 baru/lama | \|logit med err\| baru/lama |
+|---|---|---|---|---|
+| S1 cocok: 1/hari ×3.230 | **0,4398** | 0,6557 | 1,00 / 0,95 | 0,411 / 0,760 |
+| S2 lambat/kecil: 0,5/hari ×1.500 | **0,6259** | 0,7114 | 0,98 / 0,98 | 0,886 / 1,096 |
+| S3 cepat/besar: 2/hari ×6.000 | 0,4584 | **0,4297** | 1,00 / 1,00 | 0,375 / 0,338 |
+| S4 tidak ada (tanpa refresh) | 1,6162 | **0,5239** | 0,85 / 0,98 | 2,915 / 0,703 |
+
+**Dibaca jujur:** v2 menang jelas di S1 dan S2 (skenario refresh yang
+realistis — refresh memang terjadi di launch night), hampir seri di S3
+(kalah tipis pinball 0,029 dan median log-error 0,037), dan **kalah telak di
+S4**. S4 adalah dunia tanpa refresh sama sekali — yang BERTENTANGAN dengan
+refresh launch-night yang teramati. Kelemahan v2: prior refresh (1/hari)
+cukup kuat sehingga setelah 48 jam datar pun p atas horizon 4,5 hari masih
+~0,78 dan median over-dilusi kalau tracker berhenti refresh total. Mitigasi:
+(a) rate adalah posterior Gamma — history datar yang lebih panjang akan
+menurunkan p lebih jauh; (b) history final sungguhan MENGANDUNG refresh
+(lompatan 6x), jadi rate final diestimasi dari data, bukan hanya prior.
+Kalau tracker berhenti total, v2 akan over-dilusi — itu risiko yang
+dinyatakan, bukan disembunyikan. Dua perbaikan dari simulator yang sudah
+masuk ke v2: detektor langkah adaptif (poin 2) dan E[N|N≥1] (poin 2) —
+keduanya ditemukan karena v2 awal kalah dari v1 di S1/S2 pada run pertama
+simulator. Simulator deterministik (seed integer tetap per skenario —
+run pertama memakai `hash()` string yang diacak per proses Python, jadi
+angka tidak reprodusibel; diperbaiki ke seed integer 1000×s_idx+seed dan
+diverifikasi dua run identik).
+
+## Hasil backtest FINAL v2 (vs PROXY jawaban "frozen earners", p00+p01)
 
 Mean pinball loss (skala logit, 550 item: 2 case × 55 trofi × 5 kuantil):
 
 | model | loss vs proxy | keterangan |
 |---|---|---|
-| **poisson-hazard + prior GTA V (FINAL)** | **1,0840** (p00 1,0633; p01 1,1046) | median ≈ carry-forward ×1,01 di practice; typical miss 0,736 pp; coverage 90% vs proxy = 0 |
-| logit-linear provisional | 1,0727 (p00 1,0510; p01 1,0944) | median = carry-forward |
-| poisson-hazard tanpa prior (lama) | 1,0744 | median ≈ carry-forward |
-| prior-shape (faktor 1.0) | 1,0727 | median = carry-forward |
+| **poisson-hazard + prior GTA V + mixture (FINAL v2)** | **0,9643** (p00 0,9642; p01 0,9643) | typical miss 0,679 pp; coverage 90% vs proxy = 0,818 |
+| poisson-hazard v1 (FINAL v1) | 1,0840 | coverage 90% vs proxy = 0 |
+| logit-linear / prior-shape (tidak dikirim) | 1,6471 | spread-nya kini sempit (suku staleness yang salah arah dihapus) — band-nya tidak lagi menampung refresh secara kebetulan |
 | house baseline (starter, sigma 0,125) | 1,6877 | coverage 90% = 0 |
 | carry-forward titik | 1,7767 | = mean \|logit error\| vs proxy |
 
-**Jujur dibaca:** model FINAL 0,011 LEBIH BURUK dari provisional vs proxy.
-Itu bukan regresi nyata: di history datar semua median ≈ carry-forward, dan
-selisih 0,011 berasal dari median poisson yang duduk ~1% DI ATAS
-carry-forward (kurva hazard masih sedikit naik pada horizon 90 menit +
-satu read t=0 yang tak ter-fit). Terhadap jawaban SEBENARNYA — yang berada
-DI ATAS proxy (pemain baru juga mendapat trofi) — median yang sedikit lebih
-tinggi itu netral sampai membantu, bukan merugikan. Practice TIDAK BISA
-membedakan ketiga keluarga (median identik); nilai prior baru terlihat di
-final, saat history bergerak. Jangan overclaim dari angka ini.
+**Jujur dibaca:** v2 lebih baik 0,12 dari v1 vs proxy — TAPI itu bukan bukti
+modelnya lebih baik. Proxy adalah batas bawah jawaban sebenarnya, dan
+backtest practice tidak bisa memvalidasi penanganan refresh (semua median ≈
+carry-forward di history datar; yang berubah hanyalah kuantil bawah kini
+mencapai rate yang terdilusi — coverage 0,818 vs 0). Nilai mixture baru
+terlihat di final dan di simulator (§5). **Jangan laporkan 0,9643 sebagai
+"skor". Jangan tune parameter apa pun ke proxy** — HEADROOM_FRAC=0,25
+ditetapkan SEBELUM run eval, bukan di-tune ke angka ini.
 
-## Verifikasi (2026-11-19, setelah kunci model)
+## Verifikasi v2 (2026-11-19)
 
 - `python3 eval-forecast.py`: format OK (55 trofi, id 1..55, kuantil terurut,
-  tanpa NaN), deterministik byte-identik, **0,10 dtk/case** (<1 dtk).
-  Stress test history bergerak: poisson merespons (id4 median 0,83 vs last
-  0,79; id6 median 2,56 vs last 2,11) — prior tidak membekukan model.
-- Diagnostik `../diag-prior.py`: cap E_inf MENGIKAT pada grind yang naik
-  (median 9,14% vs cap 10%) dan tidak mengikat pada story (median 33,76%
-  vs cap 84%); dilusi P(t) termodelkan dan terbatas oleh cap slope
-  (median 2,29% vs last rate 2,93% pada skenario P×6, dari 0,086% sebelum
-  cap — runtuh — diperbaiki).
-- Rerun backtest setelah cap slope P(t): angka tidak berubah (P datar di
-  practice, cap tidak mengikat).
+  tanpa NaN), deterministik byte-identik, **0,07–0,10 dtk/case** (<1 dtk).
+  Mixture: p00/p01 lompatan=0, p≈0,055, ukuran=3.230, E[N|N≥1]=1,03,
+  rasio=6,21. Stress test history bergerak: poisson merespons (id4 median
+  0,83 vs last 0,79; id6 median 2,55 vs last 2,11) — prior tidak membekukan
+  model; id4 yang trennya turun di sintetis tetap dekat last rate (bentuk
+  hazard tidak bisa turun — batasan yang diketahui, lihat flag 6).
+- Diagnostik `../diag-prior.py`: cap E_inf tidak mengikat pada story yang
+  naik (median 5,28% vs cap 84%) maupun grind (median 1,38% vs cap 10%)
+  pada run v2 — median lebih rendah dari v1 (33,76% / 9,14%) karena
+  skenario refresh kini mendilusi ~3,2x yang diharapkan atas horizon 4,5
+  hari. Skenario P×6: median 3,56% vs last rate 2,93% (DI ATAS — pertumbuhan
+  earners yang berlipat mengalahkan dilusi pada sintetis itu; band lebar
+  0,14–45,68% menampung kedua arah).
+- `python3 sim-refresh.py`: lihat §5 (v2 menang S1/S2, seri S3, kalah S4).
+
+## Parameter baru v2 (lengkap, dengan status data/asumsi)
+
+| parameter | nilai | status |
+|---|---|---|
+| PRIOR_REFRESH_RATE (mean prior) | 1/24 per jam (1/hari) | ASUMSI (kadensi launch-night; tidak ada data kadensi) |
+| PRIOR_REFRESH_ALPHA / BETA_H | 1,0 / 24 jam | ASUMSI (prior Gamma; mean 1/hari) |
+| PRIOR_REFRESH_SIZE (aditif) | 3.230 pemain | DATA (3.868−638, lompatan teramati) |
+| P_REFRESH_MAX | 0,95 | judgment (jangan pernah yakin penuh) |
+| SIZE_SIGMA | 0,5 | judgment (satu ukuran teramati = satu draw) |
+| OVERDUE_SIGMA / OVERDUE_TAU_HOURS | 1,0 / 24 jam | judgment (arah benar; besaran tidak terkalibrasi) |
+| HEADROOM_FRAC | 0,25 | judgment (ditetapkan sebelum eval; tidak di-tune ke proxy) |
+| SIGMA_RW / SIGMA_CAP / SIGMA_FLOOR | 0,5 / 2,5 / 0,05 | dipertahankan dari v1 |
+| REFRESH_JUMP_RATIO | 1,5x + 5× median \|log-step\| | judgment (ambang deteksi; 6,06x teramati lolos jauh) |
+| λ0 per kelompok + penalti 0,001 | lihat §4 | ASUMSI (tidak ada kurva launch-week) |
+| E_INF_CAP_MULT | 1,5x saturasi GTA V | DATA (saturasi GTA V) + judgment (faktor 1,5x) |
 
 ## Yang di-flag untuk parent (tidak diputuskan diam-diam)
 
 1. **λ0 per kelompok adalah asumsi** (τ 24 jam–30 hari dari sifat konten),
    bukan estimasi dari data GTA V — tidak ada kurva launch-week yang bisa
-   diambil (Wayback 2013-10-29 ada tapi fetch ditolak 403). Bobot penalti
-   sengaja lemah (0,001) sehingga asumsi ini hanya memutus seri; kalau
-   history final menunjukkan λ yang jauh berbeda, data menang.
-2. **P_SLOPE_CAP = 0,01/jam adalah judgment call** (bukan dari data GTA V).
-   Kalau pertumbuhan tracked players GTA VI hari ke-2→7 ternyata >3,3x,
-   median akan kurang turun (under-dilusi) — tapi spread menampungnya, dan
-   arahnya konservatif (lebih baik daripada runtuh ke nol).
-3. **Suku staleness menyempit untuk trofi yang lama tidak berubah**
-   (stale = 1,5·exp(−gap/8 jam)): trofi langka yang dormant 48 jam di final
-   mendapat σ≈1,06 (hanya random walk), sementara upside headroom-nya ke
-   saturasi tipe bisa +3 logit — kuantil 95% mungkin tidak mencapai
-   saturasi. Tidak diubah (di luar pertanyaan 4, dan practice tidak bisa
-   mengukurnya); kalau parent mau, perbaikan yang benar adalah suku spread
-   berbasis headroom-ke-saturasi, bukan mengubah STALE_SIGMA.
-4. **Kelompok "side" adalah gabungan** (15 trofi GTA V, median 20,38%,
+   diambil (Wayback CDX 403, jangan di-retry; PSNProfiles/TrueTrophies tidak
+   punya time series). Bobot penalti sengaja lemah (0,001) sehingga asumsi
+   ini hanya memutus seri; kalau history final menunjukkan λ yang jauh
+   berbeda, data menang.
+2. **Bobot scenario mixture adalah asumsi kalau tidak tervalidasi data.**
+   Rate refresh prior (1/hari), ukuran refresh (3.230 pemain — data, tapi
+   satu draw), HEADROOM_FRAC=0,25, SIZE_SIGMA=0,5, OVERDUE_SIGMA=1,0:
+   semuanya judgment call yang tidak terkalibrasi dari data (tidak ada
+   kadensi refresh launch-week yang bisa diambil). Simulator (§5) memvalidasi
+   ARAH-nya (mixture menang saat refresh terjadi), bukan BESARAN-nya.
+3. **S4: kalau tracker berhenti refresh total, v2 over-dilusi.** Median
+   akan duduk ~3x terlalu rendah (pinball simulator 1,62 vs 0,52 v1).
+   Ini harga dari prior refresh yang kuat. Diterima karena refresh
+   launch-night membuktikan tracker refresh; history final mengandung
+   refresh, jadi rate final dari data.
+4. **Suku staleness lama dihapus — model non-shipped makin buruk vs proxy.**
+   Logit-linear/prior-shape kini 1,6471 vs proxy (dari 1,0727 di v1) karena
+   band-nya tidak lagi menampung refresh secara kebetulan. Itu perilaku yang
+   BENAR (mereka bukan model yang dikirim), bukan regresi model final.
+5. **Kelompok "side" adalah gabungan** (15 trofi GTA V, median 20,38%,
    rentang lebar 11–65%): activity/stranger/misc/exploration/economy/combat
    tidak punya analog tunggal yang bersih. Kalau satu kind ternyata
    sistematis berbeda (mis. economy jauh lebih lambat), prior-nya terlalu
    kasar — tapi cap 1,5x memberi ruang, dan spread menampung sisanya.
-5. **Backtest practice tidak memvalidasi prior** (semua median runtuh ke
-   carry-forward). Keyakinan pada prior ini berasal dari mekanisme + data
-   GTA V, bukan dari angka backtest. Jangan laporkan 1,0840 sebagai "skor".
+6. **Bentuk hazard tidak bisa memodelkan earners yang TURUN.** Pada history
+   sintetis yang trennya turun, median duduk dekat last rate (bukan di
+   bawahnya) karena E(t) monoton naik. Di final sungguhan earners tidak
+   turun (pemain hanya bertambah), jadi batasan ini tidak mengikat — tapi
+   dicatat.
+7. **Backtest practice tidak memvalidasi prior maupun mixture** (semua median
+   runtuh ke carry-forward). Keyakinan berasal dari mekanisme + data GTA V +
+   simulator (§5), bukan dari angka backtest. Jangan laporkan 0,9643 sebagai
+   "skor".
 
 ## Opsi yang tidak dipilih (alasan singkat)
 
@@ -243,3 +362,12 @@ final, saat history bergerak. Jangan overclaim dari angka ini.
   pengaman yang sama dengan harga murah.
 - **Spread lebih lebar (σ≈2):** menang vs proxy hanya karena proxy adalah
   batas bawah ekstrem; jawaban sebenarnya lebih tinggi → over-wide di final.
+- **P(t) log-linear + P_SLOPE_CAP (v1):** DIHAPUS di v2. Cap 0,01/jam adalah
+  konstanta tak terkalibrasi yang memindahkan median ~1 logit lewat satu
+  angka; keluarga yang salah untuk proses lompatan (Sonnet poin 1).
+  Simulator mengonfirmasi mixture lebih baik saat refresh terjadi (S1/S2).
+- **Ukuran refresh sebagai rasio (×6,06):** ditolak — rasio meng-compound
+  secara absurd pada refresh kedua. Bentuk aditif (3.230 pemain) dipakai.
+- **Mixture satu-refresh (v2 awal):** ditolak oleh simulator — under-dilusi
+  dan kalah dari v1 di S1/S2. Diganti E[N|N≥1] (jumlah refresh yang
+  diharapkan kalau setidaknya satu terjadi).
